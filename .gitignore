@@ -1,0 +1,19 @@
+# python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ipython / jupyter
+.ipynb_checkpoints/
+
+# virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# matplotlib cache
+.mpl_cache/
+
+# logs
+*.log
