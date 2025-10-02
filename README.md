@@ -19,7 +19,7 @@ A Python toolkit for interactive viewing of FITS images and painting masks. Desi
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/yourusername/fits-viewer.git
-cd fits-viewer
+git clone https://github.com/garrethmartin/python_fits_viewer.git
+cd python_fits_viewer
 pip install -r requirements.txt
 ```
