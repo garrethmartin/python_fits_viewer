@@ -1,6 +1,6 @@
 # FITS Viewer and Mask Painter
 
-A Python toolkit for interactive viewing of FITS images and painting masks. Designed for astronomers and data scientists working with low surface brightness (LSB) features.  
+Python tools for interactive viewing of FITS images and painting masks.
 
 ## Features
 
@@ -21,5 +21,8 @@ Clone the repository and install dependencies:
 ```bash
 git clone https://github.com/garrethmartin/python_fits_viewer.git
 cd python_fits_viewer
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate fits_viewer
+python -m ipykernel install --user --name=fits_viewer --display-name "Python (fits_viewer)"
+jupyter notebook
 ```
