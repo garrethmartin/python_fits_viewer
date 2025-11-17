@@ -1,20 +1,23 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from astropy.io import fits
 from astropy.visualization import ImageNormalize, LinearStretch, LogStretch, SqrtStretch, AsinhStretch
-from ipywidgets import interact, FloatSlider, Dropdown, Button, HBox
+from ipywidgets import interact, FloatSlider, Dropdown, Button, HBox, VBox, IntSlider
+from IPython.display import clear_output, display
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import matplotlib.colors as mcolors
 import os
 import datetime
+from astropy.stats import SigmaClip
+from scipy.stats import norm
+from photutils.background import Background2D, MedianBackground
 
 class FitsViewer:
-    def __init__(self, filename, hdu_index=0, crop=None, figsize=(8,8), mask_file=None):
-        # load fits file
-        hdu = fits.open(filename)
-        self.image_data = hdu[hdu_index].data
-        hdu.close()
+    def __init__(self, image, crop=None, figsize=(8,8), mask_file=None):
         
+        self.image_data = image
         if crop:
             self.image_data = self.image_data[crop[0]:crop[1], crop[2]:crop[3]]
 
@@ -230,3 +233,191 @@ class MaskPainter:
             filename = f"./masks/mask_{i:03d}.fits"
             fits.PrimaryHDU(mask.astype(np.uint8)).writeto(filename, overwrite=True)
             print(f"saved {filename}")
+            
+class BackgroundInteractive:
+    def __init__(self, image, figsize=(12, 6), zoom_size=300, inset_frac=0.35):
+        self.image = image
+        self.zoom_size = zoom_size       # zoom box side length (pixels)
+        self.zoom_centre = None          # (x, y) centre of current zoom
+        self.inset_frac = inset_frac     # inset size relative to residual panel
+        self.bkg_map = None
+        self.resid = None
+        self.rect = None
+        self.ax_inset = None
+
+        self.fig, self.axs = plt.subplots(1, 2, figsize=figsize)
+        self.fig.subplots_adjust(wspace=0)
+        self.axs = self.axs.flatten()
+        for ax in self.axs:
+            ax.set_axis_off()
+
+        # connect click on residual
+        self.cid = self.fig.canvas.mpl_connect('button_press_event', self.onclick)
+
+    def _compute_background(self, box_size=128, filter_size=3, sigma=3.0, maxiters=5):
+        sigma_clip = SigmaClip(sigma=sigma, maxiters=maxiters)
+        bkg_estimator = MedianBackground()
+        bkg = Background2D(
+            self.image,
+            box_size=box_size,
+            filter_size=filter_size,
+            sigma_clip=sigma_clip,
+            bkg_estimator=bkg_estimator,
+            edge_method='pad'
+        )
+        return bkg.background
+
+    def _plot(self, box_size=128):
+        self.last_box_size = box_size
+        
+        clear_output(wait=True)
+        print(f'Running for box={box_size}...')
+
+        self.bkg_map = self._compute_background(box_size)
+        self.resid = self.image - self.bkg_map
+
+        # determine residual scaling
+        lower = (100.0 - 97.5)/2.0
+        upper = 100.0 - lower
+        vmin_resid, vmax_resid = np.nanpercentile(self.resid, [lower, upper])
+
+        # background
+        self.axs[0].cla()
+        self.axs[0].imshow(np.arcsinh(self.bkg_map), origin='lower', cmap='viridis')
+        self.axs[0].set_title(f'Background (box={box_size})')
+        self.axs[0].set_axis_off()
+
+        # residual
+        self.axs[1].cla()
+        self.axs[1].imshow(np.arcsinh(self.resid), origin='lower', cmap='Greys_r',
+                           vmin=vmin_resid, vmax=vmax_resid)
+        self.axs[1].set_title('Residual (click to zoom)')
+        self.axs[1].set_axis_off()
+
+        # if a zoom was already selected, restore it
+        if self.zoom_centre is not None:
+            self._draw_zoom_elements()
+
+        self.fig.canvas.draw_idle()
+        print('Done.')
+
+    def onclick(self, event):
+        if event.inaxes != self.axs[1]:
+            return
+        self.zoom_centre = (int(event.xdata), int(event.ydata))
+        self._draw_zoom_elements()
+
+    def _draw_zoom_elements(self):
+        """Draw zoom rectangle and inset for current zoom_centre."""
+        if self.resid is None or self.zoom_centre is None:
+            return
+
+        x, y = self.zoom_centre
+        s = self.zoom_size // 2
+        ny, nx = self.resid.shape
+        x0, x1 = max(0, x - s), min(nx, x + s)
+        y0, y1 = max(0, y - s), min(ny, y + s)
+
+        sub = self.resid[y0:y1, x0:x1]
+
+        # remove any old rectangle/inset
+        if self.rect:
+            self.rect.remove()
+        if self.ax_inset:
+            self.ax_inset.remove()
+
+        # draw rectangle on residual
+        self.rect = Rectangle((x0, y0), x1 - x0, y1 - y0,
+                              edgecolor='red', facecolor='none', lw=2)
+        self.axs[1].add_patch(self.rect)
+
+        # compute normalisation for inset
+        lower = (100.0 - 97.5)/2.0
+        upper = 100.0 - lower
+        vmin, vmax = np.nanpercentile(sub, [lower, upper])
+        norm = ImageNormalize(sub, vmin=vmin, vmax=vmax, stretch=LogStretch())
+
+        # inset location (top-left)
+        self.ax_inset = inset_axes(self.axs[1],
+                                   width=f"{int(self.inset_frac*100)}%",
+                                   height=f"{int(self.inset_frac*100)}%",
+                                   loc='upper left',
+                                   borderpad=1)
+        self.ax_inset.imshow(sub, origin='lower', cmap='Greys', norm=norm)
+        self.ax_inset.set_xticks([])
+        self.ax_inset.set_yticks([])
+
+        self.fig.canvas.draw_idle()
+
+    def _update_zoom(self, zoom_size):
+        """Callback to update zoom size interactively."""
+        self.zoom_size = zoom_size
+        if self.zoom_centre is not None:
+            self._draw_zoom_elements()
+
+    def interact(self):
+        box_slider = IntSlider(value=128, min=32, max=1024, step=32,
+                               description='box size', continuous_update=False)
+        zoom_slider = IntSlider(value=self.zoom_size, min=100, max=1000, step=100,
+                                description='zoom size', continuous_update=True)
+
+        interact(self._plot, box_size=box_slider)
+        zoom_slider.observe(lambda change: self._update_zoom(change['new']), names='value')
+
+        display(VBox([zoom_slider]))
+        
+    def plot_residual_hist(self, tile_size=50, bins=50, clip_sigma=3):
+            """
+            Plot residual histogram with Gaussian overlay.
+            """
+            if self.resid is None:
+                print("Residual not computed yet. Run _plot() first.")
+                return
+            
+            box_size = getattr(self, 'last_box_size', None)
+
+            residual = self.resid
+            img_sky = self.image
+            ny, nx = residual.shape
+            tile_stds = []
+
+            # Compute standard deviations in tiles
+            for y0 in range(0, ny, tile_size):
+                for x0 in range(0, nx, tile_size):
+                    y1 = min(y0 + tile_size, ny)
+                    x1 = min(x0 + tile_size, nx)
+                    tile = img_sky[y0:y1, x0:x1]
+                    tile_stds.append(np.std(tile))
+
+            # Median sigma across all tiles (for Gaussian overlay)
+            sigma_bg = np.median(tile_stds)
+
+            # Flatten residuals
+            data = residual.ravel()
+
+            # Sigma clipping as before
+            if clip_sigma is not None:
+                mean = np.mean(data)
+                std = np.std(data)
+                mask = (data > mean - clip_sigma*std) & (data < mean + clip_sigma*std)
+                clipped_data = data[mask]
+            else:
+                clipped_data = data
+                mean = np.mean(data)
+                std = np.std(data)
+
+            # Histogram plot
+            plt.figure(figsize=(5,4))
+            counts, bins_edges, _ = plt.hist(clipped_data, bins=bins, density=True,
+                                             color='gray', edgecolor='black', alpha=0.7, label='Residuals')
+
+            # Gaussian overlay centered on 0
+            x = np.linspace(bins_edges[0], bins_edges[-1], 200)
+            plt.plot(x, norm.pdf(x, 0, sigma_bg), 'r--', lw=2, label='Expected Gaussian noise')
+
+            plt.xlabel("Residual value")
+            plt.ylabel("Normalized count")
+            plt.title(rf'Residuals (box={box_size})')
+            plt.legend(loc='lower left')
+            plt.grid(True, alpha=0.3)
+            plt.show()
