@@ -421,3 +421,322 @@ class BackgroundInteractive:
             plt.legend(loc='lower left')
             plt.grid(True, alpha=0.3)
             plt.show()
+            
+from ipywidgets import HBox, VBox, Button, IntSlider
+import numpy as np
+import os
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+
+
+class MaskPainter:
+    """MaskPainter — corrected zoom/paint mapping with unique committed mask colours and slider behaviour."""
+
+    def __init__(self, fv, brush_size=10, figsize=(8, 8)):
+        self.fv = fv
+        self.full_image = fv.image_data.copy()
+        self.full_ny, self.full_nx = self.full_image.shape
+
+        self.zoom_box_size = 300
+        self.zoom_centre = None
+        self.zoomed = False
+
+        self.image_data = self.full_image.copy()
+        self.current_mask = np.zeros_like(self.image_data, dtype=np.uint8)
+        self.full_masks = []
+        self.mask_colors = []
+
+        self.brush_size = brush_size
+        self.painting = False
+
+        self.fig, self.ax = plt.subplots(figsize=figsize)
+        self.ax.set_axis_off()
+        self.im = self.ax.imshow(self.image_data, origin='lower', cmap='gray', interpolation='nearest')
+
+        self.current_overlay_im = None
+        self.committed_overlays = []
+
+        self.next_button = Button(description='next mask', button_style='info')
+        self.next_button.on_click(self._next_mask)
+        self.save_button = Button(description='save masks', button_style='success')
+        self.save_button.on_click(self._save_masks)
+        self.reset_button = Button(description='return to original', button_style='warning')
+        self.reset_button.on_click(self._reset_to_full)
+
+        max_dim = max(200, min(1000, min(self.full_nx, self.full_ny)))
+        self.zoom_slider = IntSlider(value=self.zoom_box_size, min=200, max=1000, step=10,
+                                     description='zoom size', continuous_update=False)
+        self.zoom_slider.observe(self._on_zoom_slider_change, names='value')
+
+        display(HBox([self.next_button, self.save_button, self.reset_button, self.zoom_slider]))
+
+        os.makedirs('./masks', exist_ok=True)
+
+        self.cid_press = self.fig.canvas.mpl_connect('button_press_event', self._on_press)
+        self.cid_release = self.fig.canvas.mpl_connect('button_release_event', self._on_release)
+        self.cid_motion = self.fig.canvas.mpl_connect('motion_notify_event', self._on_motion)
+
+        self.fig.canvas.draw_idle()
+        print('MaskPainter ready — click to create a zoom crop, paint, then commit.')
+
+    def _compute_norm(self, arr):
+        try:
+            from astropy.visualization import ImageNormalize, LinearStretch, LogStretch, SqrtStretch, AsinhStretch
+            stretch_type = getattr(self.fv, 'stretch_type', 'linear')
+            contrast = getattr(self.fv, 'contrast', 1.0)
+            white_frac = getattr(self.fv, 'white_frac', 1.0)
+            scaling = getattr(self.fv, 'scaling', 99.0)
+
+            lower = (100.0 - scaling) / 2.0
+            upper = 100.0 - lower
+            vmin, vmax = np.nanpercentile(self.full_image, [lower, upper])
+            vmax_adj = vmin + white_frac * (vmax - vmin)
+            vcenter = 0.5 * (vmin + vmax_adj)
+            vhalf_range = 0.5 * (vmax_adj - vmin) / contrast
+            vmin_norm = vcenter - vhalf_range
+            vmax_norm = vcenter + vhalf_range
+
+            stretch_map = {'linear': LinearStretch(), 'log': LogStretch(), 'sqrt': SqrtStretch(), 'asinh': AsinhStretch()}
+            stretch = stretch_map.get(stretch_type, LinearStretch())
+            return ImageNormalize(arr, vmin=vmin_norm, vmax=vmax_norm, stretch=stretch)
+        except Exception:
+            return None
+
+    def _on_press(self, event):
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        xpix = int(round(event.xdata))
+        ypix = int(round(event.ydata))
+
+        if not self.zoomed:
+            # when not zoomed, event coords are full-image coords because the im extent is full-image
+            self._start_zoom_at(xpix, ypix)
+            return
+
+        # When zoomed, event.xdata/ydata are local (0..w, 0..h). Convert to full-image coordinates:
+        full_x = int(round(self.view_x0 + xpix))
+        full_y = int(round(self.view_y0 + ypix))
+
+        self.painting = True
+        self.zoom_slider.disabled = True
+        self._paint_at(full_x, full_y)
+
+    def _on_motion(self, event):
+        if not self.painting or event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        xpix = int(round(event.xdata))
+        ypix = int(round(event.ydata))
+
+        # Convert to full-image coordinates when zoomed
+        if self.zoomed:
+            full_x = int(round(self.view_x0 + xpix))
+            full_y = int(round(self.view_y0 + ypix))
+        else:
+            full_x, full_y = xpix, ypix
+
+        self._paint_at(full_x, full_y)
+
+    def _on_release(self, event):
+        if self.painting:
+            self.painting = False
+
+    def _paint_at(self, xpix, ypix):
+        if not self.zoomed:
+            return
+        x_local = xpix - self.view_x0
+        y_local = ypix - self.view_y0
+
+        h, w = self.current_mask.shape
+        if x_local < 0 or y_local < 0 or x_local >= w or y_local >= h:
+            return
+
+        yy, xx = np.ogrid[:h, :w]
+        mask_circle = (yy - y_local) ** 2 + (xx - x_local) ** 2 <= self.brush_size ** 2
+        self.current_mask[mask_circle] = 1
+
+        if self.current_overlay_im is not None:
+            self.current_overlay_im.set_data(np.ma.masked_where(self.current_mask == 0, self.current_mask))
+        else:
+            self.current_overlay_im = self.ax.imshow(np.ma.masked_where(self.current_mask == 0, self.current_mask),
+                                                     origin='lower', cmap='Reds', alpha=0.5, interpolation='nearest',
+                                                     extent=(0, self.current_mask.shape[1], 0, self.current_mask.shape[0]))
+        self.fig.canvas.draw_idle()
+
+    def _start_zoom_at(self, xpix, ypix):
+        self.zoom_centre = (xpix, ypix)
+        self._apply_zoom()
+
+
+    def _apply_zoom(self, size=None):
+        if self.zoom_centre is None:
+            return
+        if self.painting:
+            self.zoom_slider.value = self.zoom_box_size
+            print('Cannot change zoom while painting. Commit the mask first.')
+            return
+
+        if size is None:
+            size = int(self.zoom_slider.value)
+        half = size // 2
+        x, y = self.zoom_centre
+
+        # crop indices
+        x0 = max(0, x - half)
+        x1 = min(self.full_nx, x + half)
+        y0 = max(0, y - half)
+        y1 = min(self.full_ny, y + half)
+
+        self.view_x0, self.view_x1 = x0, x1
+        self.view_y0, self.view_y1 = y0, y1
+        self.zoom_box_size = size
+        self.zoomed = True
+
+        # cropped image
+        self.image_data = self.full_image[y0:y1, x0:x1]
+        self.current_mask = np.zeros_like(self.image_data, dtype=np.uint8)
+
+        self.im.set_data(self.image_data)
+        norm = self._compute_norm(self.image_data)
+        if norm:
+            try: self.im.set_norm(norm)
+            except: pass
+        h, w = self.image_data.shape
+        self.im.set_extent((0, w, 0, h))
+        self.ax.set_xlim(0, w)
+        self.ax.set_ylim(0, h)
+
+        # remove any previous local overlays
+        if self.current_overlay_im:
+            self.current_overlay_im.remove()
+            self.current_overlay_im = None
+        if hasattr(self, '_crop_committed_overlay') and self._crop_committed_overlay:
+            self._crop_committed_overlay.remove()
+            self._crop_committed_overlay = None
+
+        # show committed masks cropped to this view
+        self._show_committed_overlap_on_crop()
+        self.fig.canvas.draw_idle()
+        print(f'Zoomed to size={size} centred on {self.zoom_centre}.')
+
+    def _on_zoom_slider_change(self, change):
+        if self.painting:
+            self.zoom_slider.value = self.zoom_box_size
+            print('Cannot change zoom size while painting. Commit the mask first.')
+            return
+
+        new_size = int(change['new'])
+        if self.zoomed:
+            self.current_mask = np.zeros_like(self.current_mask)
+            if self.current_overlay_im is not None:
+                self.current_overlay_im.remove()
+                self.current_overlay_im = None
+            print('Local mask discarded because zoom size changed.')
+            self._apply_zoom(size=new_size)
+        else:
+            self.zoom_box_size = new_size
+
+    def _next_mask(self, b):
+        if not self.zoomed:
+            print('No active crop to commit from. Click to create a crop first.')
+            return
+        if not np.any(self.current_mask):
+            print('Local mask empty; nothing to commit.')
+            return
+
+        full_mask = np.zeros_like(self.full_image, dtype=np.uint8)
+        y0, y1 = self.view_y0, self.view_y1
+        x0, x1 = self.view_x0, self.view_x1
+        full_mask[y0:y1, x0:x1] = self.current_mask
+
+        color = np.random.rand(3,)
+        self.full_masks.append(full_mask)
+        self.mask_colors.append(color)
+
+        if self.current_overlay_im is not None:
+            self.current_overlay_im.remove()
+            self.current_overlay_im = None
+        self.current_mask = np.zeros_like(self.image_data, dtype=np.uint8)
+
+        self.zoom_slider.disabled = False
+        self._redraw_committed_masks()
+        if self.zoomed:
+            self._show_committed_overlap_on_crop()
+
+        print(f'Committed mask #{len(self.full_masks)}.')
+
+    def _reset_to_full(self, b=None):
+        if self.painting:
+            print('Cannot return to full image while painting. Commit or stop painting first.')
+            return
+
+        if self.current_overlay_im is not None:
+            self.current_overlay_im.remove()
+            self.current_overlay_im = None
+        self.current_mask = np.zeros_like(self.current_mask)
+
+        self.image_data = self.full_image.copy()
+        self.zoom_centre = None
+        self.zoomed = False
+        self.view_x0, self.view_x1 = 0, self.full_nx
+        self.view_y0, self.view_y1 = 0, self.full_ny
+
+        self.im.set_data(self.image_data)
+        self.im.set_extent((0, self.full_nx, 0, self.full_ny))
+        self.ax.set_xlim(0, self.full_nx)
+        self.ax.set_ylim(0, self.full_ny)
+
+        self.zoom_slider.disabled = False
+
+        self._redraw_committed_masks()
+        self.fig.canvas.draw_idle()
+        print('Returned to full image (local mask discarded).')
+
+    def _redraw_committed_masks(self):
+        for ov in self.committed_overlays:
+            ov.remove()
+        self.committed_overlays = []
+
+        for mask, color in zip(self.full_masks, self.mask_colors):
+            ov = self.ax.imshow(np.ma.masked_where(mask == 0, mask), origin='lower',
+                                cmap=mcolors.ListedColormap([color]), alpha=0.35, interpolation='nearest',
+                                extent=(0, self.full_nx, 0, self.full_ny))
+            self.committed_overlays.append(ov)
+        self.fig.canvas.draw_idle()
+
+    def _show_committed_overlap_on_crop(self):
+        if not self.zoomed or len(self.full_masks) == 0:
+            return
+        y0, y1 = self.view_y0, self.view_y1
+        x0, x1 = self.view_x0, self.view_x1
+        h, w = self.image_data.shape
+
+        display_mask = np.zeros((h, w), dtype=np.uint8)
+        display_colors = []
+        for mask, color in zip(self.full_masks, self.mask_colors):
+            cropped = mask[y0:y1, x0:x1]
+            display_mask |= cropped
+            display_colors.append(color if np.any(cropped) else None)
+
+        if hasattr(self, '_crop_committed_overlay') and self._crop_committed_overlay is not None:
+            self._crop_committed_overlay.remove()
+            self._crop_committed_overlay = None
+
+        if np.any(display_mask):
+            # assign a generic green colour for cropped view overlay
+            self._crop_committed_overlay = self.ax.imshow(np.ma.masked_where(display_mask == 0, display_mask),
+                                                          origin='lower', cmap=mcolors.ListedColormap([[0.0, 1.0, 0.0]]),
+                                                          alpha=0.35, interpolation='nearest', extent=(0, w, 0, h))
+        else:
+            self._crop_committed_overlay = None
+        self.fig.canvas.draw_idle()
+
+    def _save_masks(self, b):
+        if len(self.full_masks) == 0:
+            print('No masks to save.')
+            return
+        from astropy.io import fits
+        for i, mask in enumerate(self.full_masks):
+            filename = f"./masks/mask_{i:03d}.fits"
+            fits.PrimaryHDU(mask.astype(np.uint8)).writeto(filename, overwrite=True)
+            print(f'saved {filename}')
+
